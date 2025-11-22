@@ -1,254 +1,208 @@
-#!/bin/sh
+#!/bin/bash
 export LANG=en_US.UTF-8
 
-# === 0. 强制检查变量 ===
-if [ -z "$ARGO_AUTH" ] || [ -z "$ARGO_DOMAIN" ]; then
-    echo "❌ 错误：必须提供 ARGO_AUTH (Token) 和 ARGO_DOMAIN (域名)！"
-    echo "请先 export 这两个变量再运行脚本。"
+# ==================================================
+# 1. 变量初始化
+# ==================================================
+[ -n "$nix" ] && install_trigger="$nix"
+[ -n "$uuid" ] && export UUID="$uuid"
+[ -n "$vmpt" ] && export PORT="$vmpt"
+[ -n "$argo" ] && export ENABLE_ARGO="$argo"
+[ -n "$agn" ] && export ARGO_DOMAIN="$agn"
+[ -n "$agk" ] && export ARGO_TOKEN="$agk"
+
+export PORT=${PORT:-$(shuf -i 10000-65000 -n 1)}
+if [ -z "$UUID" ]; then
+    UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "eac8c09c-8409-4c63-a56b-187ce1f7b048")
+fi
+
+if [ "$install_trigger" != "y" ]; then
+    echo "提示：请在脚本前设置变量 nix=y 才能运行安装。"
     exit 1
 fi
 
-# 1. 变量初始化
-export uuid=${uuid:-''}
-export port_vm_ws=${vmpt:-10086} # 默认端口 10086
-export name=${name:-'FixedArgo'}
-v46url="https://icanhazip.com"
-
-# 2. 环境准备
-hostname=$(uname -a | awk '{print $2}')
-case $(uname -m) in
-aarch64) cpu=arm64;;
-x86_64) cpu=amd64;;
-*) echo "不支持当前架构" && exit
-esac
-mkdir -p "$HOME/agsbx"
-mkdir -p "$HOME/bin"
-
-# 生成 UUID
-if [ -z "$uuid" ] && [ ! -e "$HOME/agsbx/uuid" ]; then
-    uuid=$(cat /proc/sys/kernel/random/uuid)
-    echo "$uuid" > "$HOME/agsbx/uuid"
-elif [ -n "$uuid" ]; then
-    echo "$uuid" > "$HOME/agsbx/uuid"
+if [ "$ENABLE_ARGO" = "y" ] && ([ -z "$ARGO_TOKEN" ] || [ -z "$ARGO_DOMAIN" ]); then
+    echo "错误：开启 Argo 必须提供 agn (域名) 和 agk (Token)。"
+    exit 1
 fi
-uuid=$(cat "$HOME/agsbx/uuid")
 
-# 3. 安装 Xray (VMess核心)
-installxray(){
-    echo "1. 安装 Xray 内核..."
-    if [ ! -e "$HOME/agsbx/xray" ]; then
-        url="https://github.com/ka234ka/go-sbx/releases/download/argosbx/xray-$cpu"
-        out="$HOME/agsbx/xray"
-        (command -v curl >/dev/null 2>&1 && curl -Lo "$out" -# --retry 2 "$url") || (command -v wget>/dev/null 2>&1 && timeout 3 wget -O "$out" --tries=2 "$url")
-        chmod +x "$HOME/agsbx/xray"
-    fi
+# ==================================================
+# 2. 系统检测与环境准备
+# ==================================================
+arch=$(uname -m)
+case $arch in
+    x86_64) 
+        cpu_arch="amd64"
+        xray_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+        argo_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+        ;;
+    aarch64) 
+        cpu_arch="arm64" 
+        xray_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip"
+        argo_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+        ;;
+    *) echo "不支持的架构: $arch" && exit 1 ;;
+esac
 
-    # 配置 VMess (监听在 localhost 或 0.0.0.0 供 Tunnel 连接)
-    echo "2. 配置 VMess (端口: $port_vm_ws)..."
-    cat > "$HOME/agsbx/xr.json" <<EOF
+echo "CPU架构：$cpu_arch"
+echo "Argosbx脚本未安装，开始安装…………"
+
+# 安装依赖 (包含 cron)
+if [ -f /etc/alpine-release ]; then
+    apk add --no-cache curl wget unzip tar ca-certificates bash dcron >/dev/null 2>&1
+    rc-service crond start >/dev/null 2>&1
+    rc-update add crond >/dev/null 2>&1
+elif [ -f /etc/debian_version ]; then
+    apt-get update >/dev/null 2>&1 && apt-get install -y curl wget unzip tar ca-certificates cron >/dev/null 2>&1
+    systemctl enable cron >/dev/null 2>&1
+    systemctl start cron >/dev/null 2>&1
+elif [ -f /etc/redhat-release ]; then
+    yum install -y curl wget unzip tar ca-certificates cronie >/dev/null 2>&1
+    systemctl enable crond >/dev/null 2>&1
+    systemctl start crond >/dev/null 2>&1
+fi
+
+WORKDIR="$HOME/agsbx"
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+
+# ==================================================
+# 3. 安装核心组件
+# ==================================================
+echo
+echo "=========启用xray内核========="
+curl -L -o xray.zip "$xray_url" --progress-bar
+unzip -q -o xray.zip
+rm -f xray.zip geoip.dat geosite.dat
+mv xray x
+chmod +x x
+
+xray_version=$(./x version 2>/dev/null | head -n 1 | awk '{print $2}')
+echo "已安装Xray正式版内核：$xray_version"
+echo "UUID密码：$UUID"
+echo "Vmess-ws端口：$PORT"
+
+# 生成配置
+cat > config.json <<EOF
 {
   "log": { "loglevel": "none" },
   "inbounds": [
     {
-        "tag": "vmess-xr",
-        "listen": "0.0.0.0",
-        "port": ${port_vm_ws},
-        "protocol": "vmess",
-        "settings": {
-            "clients": [ { "id": "${uuid}" } ]
-        },
-        "streamSettings": {
-            "network": "ws",
-            "wsSettings": { "path": "/${uuid}-vm" }
-        }
+      "port": $PORT,
+      "protocol": "vmess",
+      "settings": { "clients": [ { "id": "$UUID" } ] },
+      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vm" } },
+      "listen": "127.0.0.1"
     }
   ],
-  "outbounds": [
-    { "protocol": "freedom", "tag": "direct" }
-  ]
+  "outbounds": [ { "protocol": "freedom" } ]
 }
 EOF
-}
 
-# 4. 安装 Cloudflared (强制)
-install_argo(){
-    echo "3. 安装 Cloudflared 隧道..."
-    if [ ! -e "$HOME/agsbx/cloudflared" ]; then
-        url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cpu"
-        out="$HOME/agsbx/cloudflared"
-        (command -v curl>/dev/null 2>&1 && curl -Lo "$out" -# --retry 2 "$url") || (command -v wget>/dev/null 2>&1 && timeout 3 wget -O "$out" --tries=2 "$url")
-        chmod +x "$HOME/agsbx/cloudflared"
-    fi
-    
-    # 记录域名供后续使用
-    echo "$ARGO_DOMAIN" > "$HOME/agsbx/argodomain.log"
-}
+echo
+echo "=========启用Cloudflared-argo内核========="
+echo "下载Cloudflared-argo最新正式版内核："
+curl -L -o cloudflared "$argo_url" --progress-bar
+chmod +x cloudflared
 
-# 5. 配置系统服务与自启
-setup_services(){
-    echo "4. 配置系统服务 (Systemd/OpenRC)..."
-    
-    # Systemd (Debian/Ubuntu/CentOS)
-    if pidof systemd >/dev/null 2>&1; then
-        # Xray
-        cat > /etc/systemd/system/xr.service <<EOF
-[Unit]
-Description=Xray Service
-After=network.target
-[Service]
-ExecStart=$HOME/agsbx/xray run -c $HOME/agsbx/xr.json
-Restart=always
-[Install]
-WantedBy=multi-user.target
-EOF
-        # Cloudflared (使用 run --token)
-        cat > /etc/systemd/system/argo.service <<EOF
-[Unit]
-Description=Argo Tunnel
-After=network.target
-[Service]
-ExecStart=$HOME/agsbx/cloudflared tunnel --no-autoupdate run --token ${ARGO_AUTH}
-Restart=always
-RestartSec=10s
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable xr argo
-        systemctl restart xr argo
-        
-    # OpenRC (Alpine)
-    elif command -v rc-service >/dev/null 2>&1; then
-        # Xray
-        cat > /etc/init.d/xray <<EOF
-#!/sbin/openrc-run
-command="$HOME/agsbx/xray"
-command_args="run -c $HOME/agsbx/xr.json"
-command_background=yes
-pidfile="/run/xray.pid"
-depend() { need net; }
-EOF
-        chmod +x /etc/init.d/xray
-        rc-update add xray default
-        rc-service xray restart
+# ==================================================
+# 4. 配置保活机制 (Watchdog) - 关键修改
+# ==================================================
+echo
+echo "正在配置进程保活监控..."
 
-        # Cloudflared
-        cat > /etc/init.d/argo <<EOF
-#!/sbin/openrc-run
-command="$HOME/agsbx/cloudflared"
-command_args="tunnel --no-autoupdate run --token ${ARGO_AUTH}"
-command_background=yes
-pidfile="/run/argo.pid"
-depend() { need net; }
-EOF
-        chmod +x /etc/init.d/argo
-        rc-update add argo default
-        rc-service argo restart
-    else
-        # Nohup fallback
-        pkill -f "$HOME/agsbx/xray"
-        pkill -f "$HOME/agsbx/cloudflared"
-        nohup "$HOME/agsbx/xray" run -c "$HOME/agsbx/xr.json" >/dev/null 2>&1 &
-        nohup "$HOME/agsbx/cloudflared" tunnel --no-autoupdate run --token "${ARGO_AUTH}" >/dev/null 2>&1 &
-    fi
-}
+# 创建守护脚本 keep_alive.sh
+cat > "$WORKDIR/keep_alive.sh" <<EOF
+#!/bin/bash
+WORKDIR="$WORKDIR"
+cd "\$WORKDIR"
 
-# 6. 看门狗 (Watchdog) - Crontab
-install_watchdog(){
-    echo "5. 配置看门狗 (Watchdog)..."
-    crontab -l > /tmp/cron.bak 2>/dev/null
-    sed -i '/agsbx/d' /tmp/cron.bak # 清理旧的
-    
-    # 写入检查逻辑 (每分钟)
-    if pidof systemd >/dev/null 2>&1; then
-        echo "*/1 * * * * systemctl is-active --quiet xr || systemctl start xr" >> /tmp/cron.bak
-        echo "*/1 * * * * systemctl is-active --quiet argo || systemctl start argo" >> /tmp/cron.bak
-    elif command -v rc-service >/dev/null 2>&1; then
-        echo "*/1 * * * * rc-service xray status >/dev/null || rc-service xray start" >> /tmp/cron.bak
-        echo "*/1 * * * * rc-service argo status >/dev/null || rc-service argo start" >> /tmp/cron.bak
-    else
-        echo "*/1 * * * * pgrep -f 'agsbx/xray' >/dev/null || nohup $HOME/agsbx/xray run -c $HOME/agsbx/xr.json >/dev/null 2>&1 &" >> /tmp/cron.bak
-        echo "*/1 * * * * pgrep -f 'cloudflared' >/dev/null || nohup $HOME/agsbx/cloudflared tunnel --no-autoupdate run --token ${ARGO_AUTH} >/dev/null 2>&1 &" >> /tmp/cron.bak
-    fi
-    
-    crontab /tmp/cron.bak
-    rm /tmp/cron.bak
-}
-
-# 7. 卸载与快捷命令
-persist_env(){
-    SCRIPT_PATH="$HOME/bin/agsbx"
-    cat > "$SCRIPT_PATH" <<EOF
-#!/bin/sh
-if [ "\$1" = "list" ]; then cat "$HOME/agsbx/jh.txt"; fi
-if [ "\$1" = "del" ]; then 
-  systemctl stop xr argo 2>/dev/null
-  rc-service xray stop 2>/dev/null
-  rc-service argo stop 2>/dev/null
-  rm -rf "$HOME/agsbx" /etc/systemd/system/xr.service /etc/systemd/system/argo.service
-  crontab -l | grep -v 'agsbx' | crontab -
-  echo "卸载完成"
-fi
-EOF
-    chmod +x "$SCRIPT_PATH"
-    if ! grep -q "$HOME/bin" "$HOME/.bashrc"; then
-        echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc"
-    fi
-}
-
-# 8. 输出链接
-print_links(){
-    sleep 2 # 等待服务启动
-    rm -f "$HOME/agsbx/jh.txt"
-    
-    echo "========================================================="
-    echo "✅ 安装成功！(仅保留 Argo 固定隧道)"
-    echo "---------------------------------------------------------"
-    echo "UUID: $uuid"
-    echo "本地端口: $port_vm_ws"
-    echo "绑定域名: $ARGO_DOMAIN"
-    echo "---------------------------------------------------------"
-    echo "⚠️ 重要提示：请确保你在 CF Zero Trust 后台已配置："
-    echo "Public Hostname -> Service: HTTP://localhost:$port_vm_ws"
-    echo "---------------------------------------------------------"
-
-    # 生成 VMess Argo 链接
-    # 注意：Host 和 SNI 必须是你的固定域名，Address 可以是域名本身也可以是优选IP
-    # 这里为了稳妥，Address 写为固定域名，端口 443，开启 TLS
-    
-    # 优选 IP 版 (Host混淆)
-    vma_cdn_link="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${name}-Argo-CDN\", \"add\": \"www.visa.com.sg\", \"port\": \"443\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN\", \"path\": \"/${uuid}-vm\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN\"}" | base64 -w0)"
-    
-    # 纯域名版
-    vma_domain_link="vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${name}-Argo-Domain\", \"add\": \"$ARGO_DOMAIN\", \"port\": \"443\", \"id\": \"$uuid\", \"aid\": \"0\", \"scy\": \"auto\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"$ARGO_DOMAIN\", \"path\": \"/${uuid}-vm\", \"tls\": \"tls\", \"sni\": \"$ARGO_DOMAIN\"}" | base64 -w0)"
-
-    echo "🔗 节点链接 1 (使用优选IP+域名混淆):"
-    echo "$vma_cdn_link"
-    echo "$vma_cdn_link" >> "$HOME/agsbx/jh.txt"
-    echo
-    echo "🔗 节点链接 2 (纯域名连接):"
-    echo "$vma_domain_link"
-    echo "$vma_domain_link" >> "$HOME/agsbx/jh.txt"
-    echo "========================================================="
-}
-
-# === 执行入口 ===
-if [ "$1" = "del" ]; then
-    systemctl stop xr argo >/dev/null 2>&1
-    rc-service xray stop 2>/dev/null
-    rc-service argo stop 2>/dev/null
-    rm -rf "$HOME/agsbx" /etc/systemd/system/xr.service /etc/systemd/system/argo.service
-    crontab -l | grep -v 'agsbx' | crontab -
-    echo "已卸载。"
-    exit
+# 检查 Xray
+if ! pgrep -f "\$WORKDIR/x run" >/dev/null; then
+    nohup ./x run -c config.json >/dev/null 2>&1 &
+    echo "\$(date): Xray restarted" >> restart.log
 fi
 
-echo "🚀 开始安装 (固定隧道版)..."
-setenforce 0 >/dev/null 2>&1
-iptables -F >/dev/null 2>&1 # 放行端口
-installxray
-install_argo
-setup_services
-install_watchdog
-persist_env
-print_links
+# 检查 Argo (如果有Token)
+if [ -n "$ARGO_TOKEN" ]; then
+    if ! pgrep -f "cloudflared tunnel" >/dev/null; then
+        nohup ./cloudflared tunnel --no-autoupdate run --token "$ARGO_TOKEN" > argo.log 2>&1 &
+        echo "\$(date): Argo restarted" >> restart.log
+    fi
+fi
+EOF
+chmod +x "$WORKDIR/keep_alive.sh"
+
+# 初次运行守护脚本启动服务
+bash "$WORKDIR/keep_alive.sh"
+
+if [ "$ENABLE_ARGO" = "y" ]; then
+    echo "申请Argo固定隧道中……请稍等"
+    sleep 5
+    if pgrep -f cloudflared >/dev/null; then
+        echo "Argo固定隧道申请成功"
+    else
+        echo "Argo启动失败，请检查 Token 是否正确"
+    fi
+fi
+
+# 添加到 Crontab (每分钟检查 + 开机自启)
+crontab -l 2>/dev/null | grep -v "keep_alive.sh" > /tmp/cron.tmp
+echo "* * * * * /bin/bash $WORKDIR/keep_alive.sh" >> /tmp/cron.tmp
+echo "@reboot /bin/bash $WORKDIR/keep_alive.sh" >> /tmp/cron.tmp
+crontab /tmp/cron.tmp
+rm -f /tmp/cron.tmp
+
+echo "Argosbx脚本进程启动成功，安装完毕"
+
+# ==================================================
+# 5. 状态与输出
+# ==================================================
+echo
+echo "=========当前三大内核运行状态========="
+echo "Sing-box：未启用"
+if pgrep -f "$WORKDIR/x" >/dev/null; then echo "Xray：运行中"; else echo "Xray：未运行"; fi
+if pgrep -f cloudflared >/dev/null; then echo "Argo：运行中"; else echo "Argo：未启用"; fi
+
+echo
+echo "=========当前服务器本地IP情况========="
+v4=$(curl -s4m5 https://icanhazip.com)
+v6=$(curl -s6m5 https://icanhazip.com)
+[ -z "$v4" ] && v4="无IPV4"
+[ -z "$v6" ] && v6="无IPV6"
+echo "本地IPV4地址：$v4"
+echo "本地IPV6地址：$v6"
+echo "服务器地区：$(curl -s https://ipapi.co/country_name/ 2>/dev/null)"
+
+echo
+echo "*********************************************************"
+echo "*********************************************************"
+echo "Argosbx脚本输出节点配置如下："
+echo
+
+if [ "$ENABLE_ARGO" = "y" ]; then
+    vmess_json=$(cat <<EOF
+{
+  "v": "2",
+  "ps": "Argo-Fixed-$ARGO_DOMAIN",
+  "add": "$ARGO_DOMAIN",
+  "port": "443",
+  "id": "$UUID",
+  "aid": "0",
+  "scy": "auto",
+  "net": "ws",
+  "type": "none",
+  "host": "$ARGO_DOMAIN",
+  "path": "/vm",
+  "tls": "tls",
+  "sni": "$ARGO_DOMAIN"
+}
+EOF
+)
+    vm_link="vmess://$(echo -n "$vmess_json" | base64 -w 0)"
+    echo "💣【 VMess-Argo-Fixed 】节点信息如下："
+    echo "$vm_link"
+else
+    echo "未启用 Argo，无输出。"
+fi
+echo
